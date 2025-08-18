@@ -4,44 +4,39 @@ import pandas as pd
 import numpy as np
 import io
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware # Import CORS Middleware
+from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from sklearn.svm import SVC
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- Supabase Connection ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-# IMPORTANT: Use the SERVICE_ROLE key for backend operations
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # --- FastAPI App ---
 app = FastAPI()
 
-# --- FIX: Add CORS Middleware ---
-# This allows your frontend (on Netlify) to communicate with your backend (on Render)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins, you can restrict this to your netlify app's url for more security
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-
-# --- Name of the storage bucket ---
 BUCKET_NAME = "daily-data"
+FUTURE_DAYS = 5 # This is our prediction window
 
 @app.get("/")
 def read_root():
     return {"status": "ML Trading Assistant Backend is running."}
 
 def analyze_dataframe(data: pd.DataFrame):
-    """Runs ML analysis on a given dataframe."""
-    
-    # --- Feature Engineering ---
+    """Runs ML analysis on a given dataframe and returns prediction results."""
+    # Feature Engineering
     delta = data['Close'].diff()
     gain = (delta.where(delta > 0, 0)).ewm(com=13, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(com=13, adjust=False).mean()
@@ -56,8 +51,7 @@ def analyze_dataframe(data: pd.DataFrame):
     data['sma_long'] = data['Close'].rolling(window=100).mean()
     data['volatility'] = data['Close'].rolling(window=20).std()
 
-    future_days = 5
-    data['Future_Close'] = data['Close'].shift(-future_days)
+    data['Future_Close'] = data['Close'].shift(-FUTURE_DAYS)
     data['Target_Direction'] = (data['Future_Close'] > data['Close']).astype(int)
     
     data.dropna(inplace=True)
@@ -65,7 +59,6 @@ def analyze_dataframe(data: pd.DataFrame):
     if len(data) < 100:
         raise ValueError("Not enough data rows after cleaning to run analysis.")
 
-    # --- Machine Learning Model ---
     features = ['rsi', 'momentum', 'sma_short', 'sma_long', 'volatility', 'bbl', 'bbu']
     X = data[features]
     
@@ -74,12 +67,14 @@ def analyze_dataframe(data: pd.DataFrame):
     X_predict_scaled = scaler.transform(X.tail(1))
     X_train_scaled = X_scaled[:-1]
 
+    # Classification Model (Direction)
     y_clf = data['Target_Direction']
     y_train_clf = y_clf.iloc[:-1]
     clf_model = SVC(kernel='rbf', random_state=42).fit(X_train_scaled, y_train_clf)
     direction_prediction = clf_model.predict(X_predict_scaled)[0]
     ml_signal = "UPWARD" if direction_prediction == 1 else "DOWNWARD"
 
+    # Regression Model (Price)
     y_reg = data['Future_Close']
     y_train_reg = y_reg.iloc[:-1]
     reg_model = LinearRegression().fit(X_train_scaled, y_train_reg)
@@ -97,7 +92,9 @@ def analyze_dataframe(data: pd.DataFrame):
 
 @app.post("/run-daily-analysis")
 async def run_daily_analysis():
-    """Reads all files from Supabase Storage, analyzes them, and saves results."""
+    """
+    Main daily job. It backtests old predictions and makes new ones.
+    """
     try:
         files = supabase.storage.from_(BUCKET_NAME).list()
     except Exception as e:
@@ -106,71 +103,108 @@ async def run_daily_analysis():
     if not files:
         return {"status": "No files found in storage bucket to analyze."}
 
-    all_predictions = {}
+    all_results = {}
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    prediction_made_on_date = (datetime.now() - timedelta(days=FUTURE_DAYS)).strftime('%Y-%m-%d')
+
     for file_info in files:
         file_name = file_info['name']
-        if not file_name.lower().endswith('.csv'):
-            continue
+        if not file_name.lower().endswith('.csv'): continue
 
         try:
-            print(f"Processing file: {file_name}...")
-            
-            # --- FIX: Extract ticker from filename ---
-            parts = file_name.split('-')
-            if len(parts) < 3:
-                print(f"Skipping file with unexpected format: {file_name}")
-                continue
-            ticker_base = parts[2]
-            ticker = f"{ticker_base}.NS" # Assume .NS for NSE stocks
-
-            # Download file from storage
+            # --- 1. Load and Process Today's Data ---
             file_content = supabase.storage.from_(BUCKET_NAME).download(file_name)
-            
-            # Read and process CSV
             data = pd.read_csv(io.BytesIO(file_content))
             data.columns = [col.strip().lower() for col in data.columns]
-            column_map = {
-                'date': 'Date', 'open': 'Open', 'open price': 'Open',
-                'high': 'High', 'high price': 'High', 'low': 'Low', 'low price': 'Low',
-                'close': 'Close', 'close price': 'Close', 'volume': 'Volume', 'total traded quantity': 'Volume'
-            }
+            column_map = {'date': 'Date', 'close': 'Close', 'close price': 'Close'}
             data.rename(columns=column_map, inplace=True)
-            
+            ticker_base = file_name.split('-')[2]
+            ticker = f"{ticker_base}.NS"
             data['Date'] = pd.to_datetime(data['Date'])
             data.set_index('Date', inplace=True)
             data.sort_index(inplace=True)
-            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                if col in data.columns and data[col].dtype == 'object':
-                    data[col] = data[col].str.replace(',', '', regex=False).astype(float)
-
-            # Get analysis results
-            prediction_result = analyze_dataframe(data)
+            if data['Close'].dtype == 'object':
+                data['Close'] = data['Close'].str.replace(',', '', regex=False).astype(float)
             
-            # Save prediction to Supabase DB
+            todays_actual_close = data.iloc[-1]['Close']
+
+            # --- 2. Backtest Yesterday's Prediction ---
+            response = supabase.table('daily_predictions').select('id, ml_direction_signal, predicted_price').eq('ticker', ticker).eq('prediction_date', prediction_made_on_date).execute()
+            
+            if response.data:
+                old_prediction = response.data[0]
+                prediction_id = old_prediction['id']
+                
+                # Backtest Direction
+                predicted_direction_was_up = old_prediction['ml_direction_signal'] == 'UPWARD'
+                past_close_response = supabase.table('daily_predictions').select('last_close_price').eq('id', prediction_id).single().execute()
+                past_close_price = past_close_response.data['last_close_price']
+                actual_direction_is_up = todays_actual_close > past_close_price
+                direction_was_correct = predicted_direction_was_up == actual_direction_is_up
+
+                # Backtest Price
+                price_pred = old_prediction['predicted_price']
+                price_error = abs(todays_actual_close - price_pred)
+
+                # Update the old record with the backtest results
+                supabase.table('daily_predictions').update({
+                    'actual_future_close': todays_actual_close,
+                    'direction_correct': direction_was_correct,
+                    'price_prediction_error': price_error
+                }).eq('id', prediction_id).execute()
+                print(f"Backtested {ticker}: Direction Correct: {direction_was_correct}, Price Error: {price_error:.2f}")
+
+            # --- 3. Make New Prediction for Today ---
+            new_prediction_result = analyze_dataframe(data)
             prediction_record = {
                 "ticker": ticker, 
-                "prediction_date": datetime.now().strftime('%Y-%m-%d'),
-                **prediction_result # Unpack the results dictionary
+                "prediction_date": today_str,
+                **new_prediction_result
             }
             supabase.table('daily_predictions').upsert(prediction_record, on_conflict='ticker, prediction_date').execute()
-            all_predictions[ticker] = prediction_result
+            all_results[ticker] = new_prediction_result
 
         except Exception as e:
             error_message = f"Error analyzing {file_name}: {str(e)}"
             print(error_message)
-            all_predictions[file_name] = {"error": error_message}
+            all_results[file_name] = {"error": error_message}
             
-    return {"status": "Analysis complete", "predictions": all_predictions}
+    return {"status": "Analysis and backtesting complete", "results": all_results}
 
 @app.get("/get-latest-predictions")
 async def get_latest_predictions():
     """Endpoint for the frontend to fetch the latest results."""
     try:
         response = supabase.table('daily_predictions').select('prediction_date').order('prediction_date', desc=True).limit(1).execute()
-        if not response.data:
-            return {"error": "No predictions found. Run the daily analysis first."}
+        if not response.data: return {"error": "No predictions found."}
         latest_date = response.data[0]['prediction_date']
         predictions_response = supabase.table('daily_predictions').select('*').eq('prediction_date', latest_date).execute()
         return predictions_response.data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/get-accuracy-stats")
+async def get_accuracy_stats():
+    """Calculates and returns the overall directional accuracy."""
+    try:
+        response = supabase.table('daily_predictions').select('direction_correct').not_.is_('direction_correct', 'null').execute()
+        if not response.data: return {"total_predictions": 0, "accuracy": 0}
+        results = [item['direction_correct'] for item in response.data]
+        correct_predictions = sum(results)
+        total_predictions = len(results)
+        accuracy = (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
+        return {"total_predictions": total_predictions, "accuracy": round(accuracy, 2)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error calculating accuracy: {str(e)}")
+
+@app.get("/get-price-error-stats")
+async def get_price_error_stats():
+    """Calculates and returns the average price prediction error."""
+    try:
+        response = supabase.table('daily_predictions').select('price_prediction_error').not_.is_('price_prediction_error', 'null').execute()
+        if not response.data: return {"avg_error": 0}
+        errors = [item['price_prediction_error'] for item in response.data]
+        avg_error = sum(errors) / len(errors) if errors else 0
+        return {"avg_error": round(avg_error, 2)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error calculating price error: {str(e)}")
