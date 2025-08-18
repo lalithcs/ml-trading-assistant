@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-yfinance
+yfinance==0.2.37
 pandas
 scikit-learn
 supabase
