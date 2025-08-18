@@ -102,6 +102,15 @@ async def run_daily_analysis():
 
         try:
             print(f"Processing file: {file_name}...")
+            
+            # --- FIX: Extract ticker from filename ---
+            parts = file_name.split('-')
+            if len(parts) < 3:
+                print(f"Skipping file with unexpected format: {file_name}")
+                continue
+            ticker_base = parts[2]
+            ticker = f"{ticker_base}.NS" # Assume .NS for NSE stocks
+
             # Download file from storage
             file_content = supabase.storage.from_(BUCKET_NAME).download(file_name)
             
@@ -114,7 +123,7 @@ async def run_daily_analysis():
                 'close': 'Close', 'close price': 'Close', 'volume': 'Volume', 'total traded quantity': 'Volume'
             }
             data.rename(columns=column_map, inplace=True)
-            ticker = data['symbol'].iloc[0]
+            
             data['Date'] = pd.to_datetime(data['Date'])
             data.set_index('Date', inplace=True)
             data.sort_index(inplace=True)
