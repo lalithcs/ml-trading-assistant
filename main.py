@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import io
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware # Import CORS Middleware
 from supabase import create_client, Client
 from sklearn.svm import SVC
 from sklearn.linear_model import LinearRegression
@@ -18,6 +19,17 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # --- FastAPI App ---
 app = FastAPI()
+
+# --- FIX: Add CORS Middleware ---
+# This allows your frontend (on Netlify) to communicate with your backend (on Render)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins, you can restrict this to your netlify app's url for more security
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
+
 
 # --- Name of the storage bucket ---
 BUCKET_NAME = "daily-data"
