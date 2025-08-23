@@ -28,7 +28,7 @@ app.add_middleware(
 )
 
 BUCKET_NAME = "daily-data"
-FUTURE_DAYS = 5 # This is our prediction window
+FUTURE_DAYS = 3 # This is our prediction window
 
 @app.get("/")
 def read_root():
@@ -83,11 +83,12 @@ def analyze_dataframe(data: pd.DataFrame):
     last_row = data.iloc[-1]
     trend_signal = "Bullish" if last_row['sma_short'] > last_row['sma_long'] else "Bearish"
 
+    # FIX: Explicitly cast types to avoid JSON serialization errors
     return {
-        "last_close_price": last_row['Close'],
-        "predicted_price": predicted_price,
-        "trend_signal": trend_signal,
-        "ml_direction_signal": ml_signal
+        "last_close_price": float(last_row['Close']),
+        "predicted_price": float(predicted_price),
+        "trend_signal": str(trend_signal),
+        "ml_direction_signal": str(ml_signal)
     }
 
 @app.post("/run-daily-analysis")
@@ -116,10 +117,12 @@ async def run_daily_analysis():
             file_content = supabase.storage.from_(BUCKET_NAME).download(file_name)
             data = pd.read_csv(io.BytesIO(file_content))
             data.columns = [col.strip().lower() for col in data.columns]
-            column_map = {'date': 'Date', 'close': 'Close', 'close price': 'Close'}
+            column_map = {'date': 'Date', 'close': 'Close', 'close price': 'Close', 'symbol': 'Symbol'}
             data.rename(columns=column_map, inplace=True)
+            
             ticker_base = file_name.split('-')[2]
             ticker = f"{ticker_base}.NS"
+            
             data['Date'] = pd.to_datetime(data['Date'])
             data.set_index('Date', inplace=True)
             data.sort_index(inplace=True)
@@ -135,22 +138,21 @@ async def run_daily_analysis():
                 old_prediction = response.data[0]
                 prediction_id = old_prediction['id']
                 
-                # Backtest Direction
                 predicted_direction_was_up = old_prediction['ml_direction_signal'] == 'UPWARD'
                 past_close_response = supabase.table('daily_predictions').select('last_close_price').eq('id', prediction_id).single().execute()
                 past_close_price = past_close_response.data['last_close_price']
                 actual_direction_is_up = todays_actual_close > past_close_price
-                direction_was_correct = predicted_direction_was_up == actual_direction_is_up
+                
+                # FIX: Explicitly cast to Python bool
+                direction_was_correct = bool(predicted_direction_was_up == actual_direction_is_up)
 
-                # Backtest Price
                 price_pred = old_prediction['predicted_price']
                 price_error = abs(todays_actual_close - price_pred)
 
-                # Update the old record with the backtest results
                 supabase.table('daily_predictions').update({
-                    'actual_future_close': todays_actual_close,
+                    'actual_future_close': float(todays_actual_close),
                     'direction_correct': direction_was_correct,
-                    'price_prediction_error': price_error
+                    'price_prediction_error': float(price_error)
                 }).eq('id', prediction_id).execute()
                 print(f"Backtested {ticker}: Direction Correct: {direction_was_correct}, Price Error: {price_error:.2f}")
 
