@@ -138,7 +138,8 @@ async def run_daily_analysis():
             todays_actual_close = data.iloc[-1]['Close']
 
             # --- 2. Backtest Yesterday's Prediction ---
-            response = supabase.table('daily_predictions').select('id, ml_direction_signal, predicted_price, last_close_price').eq('ticker', ticker).like('prediction_date', f'{prediction_made_on_date}%').execute()
+            # FIX: Use .eq for exact date match instead of .like
+            response = supabase.table('daily_predictions').select('id, ml_direction_signal, predicted_price, last_close_price').eq('ticker', ticker).eq('prediction_date', prediction_made_on_date).execute()
             
             if response.data:
                 old_prediction = response.data[0]
