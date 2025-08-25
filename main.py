@@ -136,7 +136,8 @@ async def run_daily_analysis():
             
             last_date_in_file = data.index[-1]
             prediction_date_str = last_date_in_file.strftime('%Y-%m-%d')
-            previous_trading_day = last_date_in_file - pd.tseries.bday.BDay(1)
+            # --- FIX: Use a more compatible way to find the previous business day ---
+            previous_trading_day = last_date_in_file - pd.offsets.BDay(1)
             previous_trading_day_str = previous_trading_day.strftime('%Y-%m-%d')
             
             todays_actual_close = data.iloc[-1]['Close']
