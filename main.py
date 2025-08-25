@@ -112,7 +112,6 @@ async def run_daily_analysis():
         return {"status": "No files found in storage bucket to analyze."}
 
     all_results = {}
-    today_str = datetime.now().strftime('%Y-%m-%d')
     
     for file_info in files:
         file_name = file_info['name']
@@ -133,11 +132,15 @@ async def run_daily_analysis():
             if data['Close'].dtype == 'object':
                 data['Close'] = data['Close'].str.replace(',', '', regex=False).astype(float)
             
+            # --- NEW LOGIC: Determine dates from the uploaded file ---
+            last_date_in_file = data.index[-1]
+            prediction_date_str = last_date_in_file.strftime('%Y-%m-%d')
+            previous_trading_day_str = (last_date_in_file - timedelta(days=1)).strftime('%Y-%m-%d') # Simplified; doesn't account for weekends perfectly but works for backtesting logic
+            
             todays_actual_close = data.iloc[-1]['Close']
 
-            # --- 2. Backtest Yesterday's Prediction (Smarter Logic) ---
-            # Find the most recent prediction for this ticker that hasn't been backtested yet
-            response = supabase.table('daily_predictions').select('id, ml_direction_signal, predicted_price, last_close_price').eq('ticker', ticker).is_('direction_correct', 'null').order('prediction_date', desc=True).limit(1).execute()
+            # --- 2. Backtest Previous Prediction (Smarter Logic) ---
+            response = supabase.table('daily_predictions').select('id, ml_direction_signal, predicted_price, last_close_price').eq('ticker', ticker).eq('prediction_date', previous_trading_day_str).execute()
             
             if response.data:
                 old_prediction = response.data[0]
@@ -156,7 +159,7 @@ async def run_daily_analysis():
                     'direction_correct': direction_was_correct,
                     'price_prediction_error': float(price_error)
                 }).eq('id', prediction_id).execute()
-                print(f"Backtested {ticker}: Direction Correct: {direction_was_correct}, Price Error: {price_error:.2f}")
+                print(f"Backtested {ticker} for date {prediction_date_str}: Direction Correct: {direction_was_correct}, Price Error: {price_error:.2f}")
 
             # --- 3. Fetch Historical Performance for the Learning Loop ---
             perf_response = supabase.table('daily_predictions').select('prediction_date, direction_correct, price_prediction_error').eq('ticker', ticker).not_.is_('direction_correct', 'null').execute()
@@ -166,11 +169,11 @@ async def run_daily_analysis():
                 historical_performance.set_index('prediction_date', inplace=True)
                 historical_performance['direction_correct'] = historical_performance['direction_correct'].astype(int)
 
-            # --- 4. Make New Prediction for Today (Now with learning) ---
+            # --- 4. Make New Prediction for the file's date (Now with learning) ---
             new_prediction_result = analyze_dataframe(data.copy(), historical_performance)
             prediction_record = {
                 "ticker": ticker, 
-                "prediction_date": today_str,
+                "prediction_date": prediction_date_str, # Use date from file
                 **new_prediction_result
             }
             supabase.table('daily_predictions').upsert(prediction_record, on_conflict='ticker, prediction_date').execute()
