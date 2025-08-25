@@ -28,7 +28,7 @@ app.add_middleware(
 )
 
 BUCKET_NAME = "daily-data"
-FUTURE_DAYS = 1 # Changed to predict the very next day
+FUTURE_DAYS = 1 # Predict the very next day
 
 @app.get("/")
 def read_root():
@@ -113,9 +113,7 @@ async def run_daily_analysis():
 
     all_results = {}
     today_str = datetime.now().strftime('%Y-%m-%d')
-    # Look for a prediction made yesterday (or the last trading day)
-    prediction_made_on_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-
+    
     for file_info in files:
         file_name = file_info['name']
         if not file_name.lower().endswith('.csv'): continue
@@ -137,9 +135,9 @@ async def run_daily_analysis():
             
             todays_actual_close = data.iloc[-1]['Close']
 
-            # --- 2. Backtest Yesterday's Prediction ---
-            # FIX: Use .eq for exact date match instead of .like
-            response = supabase.table('daily_predictions').select('id, ml_direction_signal, predicted_price, last_close_price').eq('ticker', ticker).eq('prediction_date', prediction_made_on_date).execute()
+            # --- 2. Backtest Yesterday's Prediction (Smarter Logic) ---
+            # Find the most recent prediction for this ticker that hasn't been backtested yet
+            response = supabase.table('daily_predictions').select('id, ml_direction_signal, predicted_price, last_close_price').eq('ticker', ticker).is_('direction_correct', 'null').order('prediction_date', desc=True).limit(1).execute()
             
             if response.data:
                 old_prediction = response.data[0]
