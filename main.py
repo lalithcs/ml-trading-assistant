@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # --- Supabase Connection ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -18,6 +18,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # --- FastAPI App ---
 app = FastAPI()
 
+# --- CORS Middleware to allow frontend connection ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,6 +32,7 @@ FUTURE_DAYS = 1
 
 @app.get("/")
 def read_root():
+    """A simple endpoint to check if the server is running."""
     return {"status": "ML Trading Assistant Backend is running."}
 
 def analyze_dataframe(data: pd.DataFrame, historical_performance: pd.DataFrame):
@@ -74,7 +76,6 @@ def analyze_dataframe(data: pd.DataFrame, historical_performance: pd.DataFrame):
     X_predict_scaled = scaler.transform(X.tail(1))
     X_train_scaled = X_scaled[:-1]
 
-    # Using RandomForest for better performance and feature importance
     y_clf = data['Target_Direction']
     y_train_clf = y_clf.iloc[:-1]
     clf_model = RandomForestClassifier(n_estimators=100, random_state=42).fit(X_train_scaled, y_train_clf)
@@ -89,9 +90,8 @@ def analyze_dataframe(data: pd.DataFrame, historical_performance: pd.DataFrame):
     last_row = data.iloc[-1]
     trend_signal = "Bullish" if last_row['sma_short'] > last_row['sma_long'] else "Bearish"
 
-    # Get feature importance
     importances = clf_model.feature_importances_
-    feature_importance_dict = {feature: importance for feature, importance in zip(features, importances)}
+    feature_importance_dict = {feature: float(importance) for feature, importance in zip(features, importances)}
 
     return {
         "last_close_price": float(last_row['Close']),
@@ -113,14 +113,12 @@ async def run_daily_analysis():
         return {"status": "No files found in storage bucket to analyze."}
 
     all_results = {}
-    today_str = datetime.now().strftime('%Y-%m-%d')
     
     for file_info in files:
         file_name = file_info['name']
         if not file_name.lower().endswith('.csv'): continue
 
         try:
-            # --- 1. Load and Process Today's Data ---
             file_content = supabase.storage.from_(BUCKET_NAME).download(file_name)
             data = pd.read_csv(io.BytesIO(file_content))
             data.columns = [col.strip().lower() for col in data.columns]
@@ -136,13 +134,11 @@ async def run_daily_analysis():
             
             last_date_in_file = data.index[-1]
             prediction_date_str = last_date_in_file.strftime('%Y-%m-%d')
-            # --- FIX: Use a more compatible way to find the previous business day ---
             previous_trading_day = last_date_in_file - pd.offsets.BDay(1)
             previous_trading_day_str = previous_trading_day.strftime('%Y-%m-%d')
             
             todays_actual_close = data.iloc[-1]['Close']
 
-            # --- 2. Backtest Previous Prediction ---
             response = supabase.table('daily_predictions').select('id, ml_direction_signal, predicted_price, last_close_price').eq('ticker', ticker).eq('prediction_date', previous_trading_day_str).execute()
             
             if response.data:
@@ -161,7 +157,6 @@ async def run_daily_analysis():
                     'price_prediction_error': float(price_error)
                 }).eq('id', prediction_id).execute()
 
-            # --- 3. Fetch Historical Performance for the Learning Loop ---
             perf_response = supabase.table('daily_predictions').select('prediction_date, direction_correct, price_prediction_error').eq('ticker', ticker).not_.is_('direction_correct', 'null').execute()
             historical_performance = pd.DataFrame(perf_response.data)
             if not historical_performance.empty:
@@ -169,7 +164,6 @@ async def run_daily_analysis():
                 historical_performance.set_index('prediction_date', inplace=True)
                 historical_performance['direction_correct'] = historical_performance['direction_correct'].astype(int)
 
-            # --- 4. Make New Prediction for Today ---
             new_prediction_result = analyze_dataframe(data.copy(), historical_performance)
             
             prediction_record = {
@@ -190,14 +184,24 @@ async def run_daily_analysis():
             
     return {"status": "Analysis complete", "results": all_results}
 
+@app.get("/get-latest-predictions")
+async def get_latest_predictions():
+    """Endpoint for the frontend to fetch the latest results."""
+    try:
+        response = supabase.table('daily_predictions').select('prediction_date').order('prediction_date', desc=True).limit(1).execute()
+        if not response.data: return {"error": "No predictions found."}
+        latest_date = response.data[0]['prediction_date']
+        predictions_response = supabase.table('daily_predictions').select('*').eq('prediction_date', latest_date).execute()
+        return predictions_response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/get-performance-stats")
 async def get_performance_stats():
     """Calculates and returns per-ticker performance stats."""
     try:
         response = supabase.table('daily_predictions').select('ticker, direction_correct, price_prediction_error').not_.is_('direction_correct', 'null').execute()
-        if not response.data:
-            return {}
+        if not response.data: return {}
         
         df = pd.DataFrame(response.data)
         
@@ -205,32 +209,26 @@ async def get_performance_stats():
         error_stats = df.groupby('ticker')['price_prediction_error'].mean().round(2)
         
         combined_stats = {}
-        for ticker in accuracy_stats.index:
+        for ticker in df['ticker'].unique():
             combined_stats[ticker] = {
                 "accuracy": accuracy_stats.get(ticker, 0),
                 "avg_error": error_stats.get(ticker, 0),
                 "total_predictions": int(df[df['ticker'] == ticker]['direction_correct'].count())
             }
-            
         return combined_stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calculating stats: {str(e)}")
 
 @app.get("/get-feature-importance")
 async def get_feature_importance():
-    """
-    Calculates and returns the feature importance from a model trained on the most recent data
-    for the first available stock. This gives a general idea of what the model is "thinking".
-    """
+    """Calculates and returns feature importance from a model trained on the most recent data."""
     try:
-        # Find the most recently updated file in the bucket
         files = supabase.storage.from_(BUCKET_NAME).list(options={"sortBy": {"column": "updated_at", "order": "desc"}})
         if not files:
             raise HTTPException(status_code=404, detail="No data files found in storage.")
         
         latest_file_name = files[0]['name']
         
-        # Load and analyze this file to get the feature importances
         file_content = supabase.storage.from_(BUCKET_NAME).download(latest_file_name)
         data = pd.read_csv(io.BytesIO(file_content))
         data.columns = [col.strip().lower() for col in data.columns]
@@ -242,10 +240,8 @@ async def get_feature_importance():
         if data['Close'].dtype == 'object':
             data['Close'] = data['Close'].str.replace(',', '', regex=False).astype(float)
         
-        # We don't need historical performance for this, just a general model training
         analysis_result = analyze_dataframe(data.copy(), pd.DataFrame())
         
         return analysis_result.get("feature_importance", {})
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calculating feature importance: {str(e)}")
