@@ -43,6 +43,9 @@ def read_root():
 
 def get_data_from_alpha_vantage(ticker: str):
     """Fetches both time series and fundamental data for a given ticker."""
+    if not ALPHA_VANTAGE_API_KEY:
+        raise ValueError("ALPHA_VANTAGE_API_KEY is not set in environment variables.")
+
     # 1. Fetch Historical Price Data
     url_prices = f'https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={ticker}&outputsize=full&apikey={ALPHA_VANTAGE_API_KEY}&datatype=csv'
     response_prices = requests.get(url_prices)
@@ -50,13 +53,11 @@ def get_data_from_alpha_vantage(ticker: str):
         raise ValueError(f"Could not fetch price data for {ticker}. Status: {response_prices.status_code}")
     
     csv_text = response_prices.text
-    if "Error Message" in csv_text or "Invalid API call" in csv_text:
-         raise ValueError(f"Alpha Vantage API error for {ticker}: {csv_text}")
+    # NEW: Robust check for API error messages
+    if not csv_text.strip().startswith('timestamp'):
+         raise ValueError(f"Alpha Vantage did not return valid CSV data for {ticker}. Response: {csv_text[:200]}")
 
     price_data = pd.read_csv(io.StringIO(csv_text))
-    
-    if 'timestamp' not in price_data.columns:
-        raise ValueError(f"'timestamp' column not found in price data for {ticker}.")
         
     price_data.rename(columns={
         'timestamp': 'Date', 'adjusted_close': 'Close', 'open': 'Open',
@@ -154,6 +155,7 @@ async def run_daily_analysis():
             price_data, fundamentals = get_data_from_alpha_vantage(ticker)
             last_date_in_file = price_data.index[-1]
             prediction_date_str = last_date_in_file.strftime('%Y-%m-%d')
+            # Use pandas to find the last business day, which handles weekends/holidays
             previous_trading_day = last_date_in_file - pd.tseries.offsets.BusinessDay(n=1)
             previous_trading_day_str = previous_trading_day.strftime('%Y-%m-%d')
             todays_actual_close = price_data.iloc[-1]['Close']
@@ -199,6 +201,7 @@ async def run_daily_analysis():
             print(error_message)
             all_results[ticker] = {"error": error_message}
         
+        # Respect Alpha Vantage free tier API limit
         time.sleep(13)
             
     return {"status": "Analysis complete", "results": all_results}
@@ -237,8 +240,11 @@ async def get_performance_stats():
 async def get_feature_importance():
     try:
         example_ticker = TICKERS_TO_ANALYZE[0]
+        # Respect API limit by adding a delay
+        time.sleep(13)
         price_data, fundamentals = get_data_from_alpha_vantage(example_ticker)
         empty_perf = pd.DataFrame(columns=['prediction_date', 'direction_correct', 'price_prediction_error']).set_index('prediction_date')
+        
         analysis_result = analyze_dataframe(price_data.copy(), empty_perf, fundamentals)
         return analysis_result.get("feature_importance", {})
     except Exception as e:
