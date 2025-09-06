@@ -43,37 +43,39 @@ def read_root():
 
 def get_data_from_alpha_vantage(ticker: str):
     """Fetches both time series and fundamental data for a given ticker."""
-    # Note: Alpha Vantage free tier has a limit of 25 calls per day.
-    # This function makes 2 calls per ticker.
-    
     # 1. Fetch Historical Price Data
     url_prices = f'https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={ticker}&outputsize=full&apikey={ALPHA_VANTAGE_API_KEY}&datatype=csv'
     response_prices = requests.get(url_prices)
     if response_prices.status_code != 200:
-        raise ValueError(f"Could not fetch price data for {ticker}.")
+        raise ValueError(f"Could not fetch price data for {ticker}. Status: {response_prices.status_code}")
     
-    price_data = pd.read_csv(io.StringIO(response_prices.text))
+    csv_text = response_prices.text
+    if "Error Message" in csv_text or "Invalid API call" in csv_text:
+         raise ValueError(f"Alpha Vantage API error for {ticker}: {csv_text}")
+
+    price_data = pd.read_csv(io.StringIO(csv_text))
+    
+    if 'timestamp' not in price_data.columns:
+        raise ValueError(f"'timestamp' column not found in price data for {ticker}.")
+        
     price_data.rename(columns={
-        'timestamp': 'Date',
-        'adjusted_close': 'Close',
-        'open': 'Open',
-        'high': 'High',
-        'low': 'Low',
-        'volume': 'Volume'
+        'timestamp': 'Date', 'adjusted_close': 'Close', 'open': 'Open',
+        'high': 'High', 'low': 'Low', 'volume': 'Volume'
     }, inplace=True)
     price_data['Date'] = pd.to_datetime(price_data['Date'])
     price_data.set_index('Date', inplace=True)
     price_data.sort_index(inplace=True)
 
     # 2. Fetch Fundamental Data
+    time.sleep(13) # Add delay between API calls
     url_overview = f'https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={ALPHA_VANTAGE_API_KEY}'
     response_overview = requests.get(url_overview)
     if response_overview.status_code != 200:
-        raise ValueError(f"Could not fetch fundamental data for {ticker}.")
+        raise ValueError(f"Could not fetch fundamental data for {ticker}. Status: {response_overview.status_code}")
         
     overview_data = response_overview.json()
-    if not overview_data or 'PERatio' not in overview_data or overview_data.get('PERatio') == 'None':
-        raise ValueError(f"Fundamental data incomplete for {ticker}.")
+    if not overview_data or 'PERatio' not in overview_data or overview_data.get('PERatio') in [None, 'None']:
+        raise ValueError(f"Fundamental data incomplete or missing for {ticker}.")
 
     fundamentals = {
         'pe_ratio': float(overview_data.get('PERatio', 0)),
@@ -97,21 +99,15 @@ def analyze_dataframe(data: pd.DataFrame, historical_performance: pd.DataFrame, 
     data['sma_long'] = data['Close'].rolling(window=100).mean()
     data['volatility'] = data['Close'].rolling(window=20).std()
     
-    # --- Add Fundamental Features ---
     for key, value in fundamentals.items():
         data[key] = value
 
-    # --- Learning Loop Feature ---
     if not historical_performance.empty:
         data = data.merge(historical_performance, left_index=True, right_index=True, how='left')
         data['direction_correct'].fillna(method='ffill', inplace=True)
         data['price_prediction_error'].fillna(method='ffill', inplace=True)
-        data.fillna({'direction_correct': 0.5, 'price_prediction_error': data['price_prediction_error'].mean()}, inplace=True)
-    else:
-        data['direction_correct'] = 0.5
-        data['price_prediction_error'] = 0
+    data.fillna({'direction_correct': 0.5, 'price_prediction_error': data['price_prediction_error'].mean()}, inplace=True)
 
-    # --- Prepare Data for ML ---
     data['Future_Close'] = data['Close'].shift(-FUTURE_DAYS)
     data['Target_Direction'] = (data['Future_Close'] > data['Close']).astype(int)
     data.dropna(inplace=True)
@@ -125,77 +121,57 @@ def analyze_dataframe(data: pd.DataFrame, historical_performance: pd.DataFrame, 
         'direction_correct', 'price_prediction_error'
     ]
     X = data[features]
-    
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     X_predict_scaled = scaler.transform(X.tail(1))
     X_train_scaled = X_scaled[:-1]
 
-    # --- Machine Learning Models ---
     y_clf = data['Target_Direction']
-    y_train_clf = y_clf.iloc[:-1]
-    clf_model = RandomForestClassifier(n_estimators=100, random_state=42).fit(X_train_scaled, y_train_clf)
+    clf_model = RandomForestClassifier(n_estimators=100, random_state=42).fit(X_train_scaled, y_clf.iloc[:-1])
     direction_prediction = clf_model.predict(X_predict_scaled)[0]
     ml_signal = "UPWARD" if direction_prediction == 1 else "DOWNWARD"
 
     y_reg = data['Future_Close']
-    y_train_reg = y_reg.iloc[:-1]
-    reg_model = RandomForestRegressor(n_estimators=100, random_state=42).fit(X_train_scaled, y_train_reg)
+    reg_model = RandomForestRegressor(n_estimators=100, random_state=42).fit(X_train_scaled, y_reg.iloc[:-1])
     predicted_price = reg_model.predict(X_predict_scaled)[0]
 
     last_row = data.iloc[-1]
     trend_signal = "Bullish" if last_row['sma_short'] > last_row['sma_long'] else "Bearish"
-
     importances = clf_model.feature_importances_
     feature_importance_dict = {feature: float(importance) for feature, importance in zip(features, importances)}
 
     return {
-        "last_close_price": float(last_row['Close']),
-        "predicted_price": float(predicted_price),
-        "trend_signal": str(trend_signal),
-        "ml_direction_signal": str(ml_signal),
-        "fundamentals": fundamentals,
-        "feature_importance": feature_importance_dict
+        "last_close_price": float(last_row['Close']), "predicted_price": float(predicted_price),
+        "trend_signal": str(trend_signal), "ml_direction_signal": str(ml_signal),
+        "fundamentals": fundamentals, "feature_importance": feature_importance_dict
     }
 
 @app.post("/run-daily-analysis")
 async def run_daily_analysis():
-    """Main daily job. Fetches data, backtests, and makes new predictions."""
     all_results = {}
-    
     for ticker in TICKERS_TO_ANALYZE:
         try:
-            # --- 1. Fetch latest data from Alpha Vantage ---
             price_data, fundamentals = get_data_from_alpha_vantage(ticker)
             last_date_in_file = price_data.index[-1]
             prediction_date_str = last_date_in_file.strftime('%Y-%m-%d')
-            
-            # Use pandas to find the last business day, which handles weekends/holidays
             previous_trading_day = last_date_in_file - pd.tseries.offsets.BusinessDay(n=1)
             previous_trading_day_str = previous_trading_day.strftime('%Y-%m-%d')
-            
             todays_actual_close = price_data.iloc[-1]['Close']
 
-            # --- 2. Backtest Yesterday's Prediction ---
             response = supabase.table('daily_predictions').select('id, ml_direction_signal, predicted_price, last_close_price').eq('ticker', ticker).eq('prediction_date', previous_trading_day_str).execute()
-            
             if response.data:
                 old_prediction = response.data[0]
-                prediction_id = old_prediction['id']
+                prediction_id, past_close_price = old_prediction['id'], old_prediction['last_close_price']
                 predicted_direction_was_up = old_prediction['ml_direction_signal'] == 'UPWARD'
-                past_close_price = old_prediction['last_close_price']
                 actual_direction_is_up = todays_actual_close > past_close_price
                 direction_was_correct = bool(predicted_direction_was_up == actual_direction_is_up)
-                price_pred = old_prediction['predicted_price']
-                price_error = abs(todays_actual_close - price_pred)
-
+                price_error = abs(todays_actual_close - old_prediction['predicted_price'])
                 supabase.table('daily_predictions').update({
                     'actual_future_close': float(todays_actual_close),
                     'direction_correct': direction_was_correct,
                     'price_prediction_error': float(price_error)
                 }).eq('id', prediction_id).execute()
 
-            # --- 3. Get Learning Data ---
             perf_response = supabase.table('daily_predictions').select('prediction_date, direction_correct, price_prediction_error').eq('ticker', ticker).not_.is_('direction_correct', 'null').execute()
             historical_performance = pd.DataFrame(perf_response.data)
             if not historical_performance.empty:
@@ -203,12 +179,10 @@ async def run_daily_analysis():
                 historical_performance.set_index('prediction_date', inplace=True)
                 historical_performance['direction_correct'] = historical_performance['direction_correct'].astype(int)
 
-            # --- 4. Make New Prediction ---
             new_prediction_result = analyze_dataframe(price_data.copy(), historical_performance, fundamentals)
             
             prediction_record = {
-                "ticker": ticker, 
-                "prediction_date": prediction_date_str,
+                "ticker": ticker, "prediction_date": prediction_date_str,
                 "last_close_price": new_prediction_result["last_close_price"],
                 "predicted_price": new_prediction_result["predicted_price"],
                 "trend_signal": new_prediction_result["trend_signal"],
@@ -220,14 +194,12 @@ async def run_daily_analysis():
             }
             supabase.table('daily_predictions').upsert(prediction_record, on_conflict='ticker, prediction_date').execute()
             all_results[ticker] = new_prediction_result
-
         except Exception as e:
             error_message = f"Error analyzing {ticker}: {str(e)}"
             print(error_message)
             all_results[ticker] = {"error": error_message}
         
-        # Respect Alpha Vantage free tier API limit (25 per day)
-        time.sleep(13) # Sleep for 13 seconds between tickers
+        time.sleep(13)
             
     return {"status": "Analysis complete", "results": all_results}
 
@@ -264,10 +236,11 @@ async def get_performance_stats():
 @app.get("/get-feature-importance")
 async def get_feature_importance():
     try:
-        # Get the first ticker from our list to use as a representative example
         example_ticker = TICKERS_TO_ANALYZE[0]
         price_data, fundamentals = get_data_from_alpha_vantage(example_ticker)
-        analysis_result = analyze_dataframe(price_data.copy(), pd.DataFrame(), fundamentals)
+        empty_perf = pd.DataFrame(columns=['prediction_date', 'direction_correct', 'price_prediction_error']).set_index('prediction_date')
+        analysis_result = analyze_dataframe(price_data.copy(), empty_perf, fundamentals)
         return analysis_result.get("feature_importance", {})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calculating feature importance: {str(e)}")
+
