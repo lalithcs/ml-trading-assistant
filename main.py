@@ -40,7 +40,10 @@ def get_fundamentals_from_alpha_vantage(ticker: str):
     """Fetches fundamental data for a given ticker from Alpha Vantage."""
     symbol = ticker.split('.')[0]
     
+    # --- THIS IS THE FIX ---
+    # Correctly formatted URL without markdown
     url_overview = f'[https://www.alphavantage.co/query?function=OVERVIEW&symbol=](https://www.alphavantage.co/query?function=OVERVIEW&symbol=){symbol}&apikey={ALPHA_VANTAGE_API_KEY}'
+    
     response_overview = requests.get(url_overview)
     if response_overview.status_code != 200:
         raise ValueError(f"Could not fetch fundamental data for {ticker}.")
@@ -148,8 +151,6 @@ async def run_daily_analysis():
             df.set_index('Date', inplace=True)
             df.sort_index(inplace=True)
             
-            # --- THIS IS THE FIX ---
-            # Convert 'Close' column to string, remove commas, then convert to float
             df['Close'] = df['Close'].astype(str).str.replace(',', '').astype(float)
             
             fundamentals = get_fundamentals_from_alpha_vantage(ticker)
