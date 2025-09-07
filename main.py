@@ -40,7 +40,7 @@ def get_fundamentals_from_alpha_vantage(ticker: str):
     """Fetches fundamental data, returning defaults if incomplete."""
     symbol = ticker.split('.')[0]
     
-    url_overview = f'[https://www.alphavantage.co/query?function=OVERVIEW&symbol=](https://www.alphavantage.co/query?function=OVERVIEW&symbol=){symbol}&apikey={ALPHA_VANTAGE_API_KEY}'
+    url_overview = f'https://www.alphavantage.co/query?function=OVERVIEW&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}'
     
     try:
         response_overview = requests.get(url_overview)
@@ -259,3 +259,4 @@ async def get_performance_stats():
         return combined_stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calculating stats: {str(e)}")
+
