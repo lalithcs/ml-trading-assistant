@@ -37,36 +37,39 @@ def read_root():
     return {"status": "ML Trading Assistant Backend (v4 - Hybrid) is running."}
 
 def get_fundamentals_from_alpha_vantage(ticker: str):
-    """Fetches fundamental data for a given ticker from Alpha Vantage."""
+    """Fetches fundamental data, returning defaults if incomplete."""
     symbol = ticker.split('.')[0]
     
-    # --- THIS IS THE FIX ---
-    # Correctly formatted URL without markdown
-    url_overview = f'https://www.alphavantage.co/query?function=OVERVIEW&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}'
+    url_overview = f'[https://www.alphavantage.co/query?function=OVERVIEW&symbol=](https://www.alphavantage.co/query?function=OVERVIEW&symbol=){symbol}&apikey={ALPHA_VANTAGE_API_KEY}'
     
-    response_overview = requests.get(url_overview)
-    if response_overview.status_code != 200:
-        raise ValueError(f"Could not fetch fundamental data for {ticker}.")
-        
-    overview_data = response_overview.json()
-    if not overview_data or 'PERatio' not in overview_data or overview_data.get('PERatio') in [None, 'None']:
-        if ticker.endswith(".BSE"):
-             time.sleep(13)
-             return get_fundamentals_from_alpha_vantage(f"{symbol}.NS")
-        raise ValueError(f"Fundamental data incomplete or missing for {ticker}.")
+    try:
+        response_overview = requests.get(url_overview)
+        response_overview.raise_for_status()
+        overview_data = response_overview.json()
 
-    return {
-        'pe_ratio': float(overview_data.get('PERatio', 0)),
-        'eps': float(overview_data.get('EPS', 0)),
-        'book_value': float(overview_data.get('BookValue', 0)),
-        'dividend_yield': float(overview_data.get('DividendYield', 0)) * 100
-    }
+        # --- THIS IS THE FIX ---
+        # If data is incomplete, return a default dictionary instead of raising an error
+        if not overview_data or 'PERatio' not in overview_data or overview_data.get('PERatio') in [None, 'None']:
+            print(f"Warning: Fundamental data incomplete for {ticker}. Proceeding with technical analysis only.")
+            return { 'pe_ratio': 0, 'eps': 0, 'book_value': 0, 'dividend_yield': 0 }
+
+        return {
+            'pe_ratio': float(overview_data.get('PERatio', 0)),
+            'eps': float(overview_data.get('EPS', 0)),
+            'book_value': float(overview_data.get('BookValue', 0)),
+            'dividend_yield': float(overview_data.get('DividendYield', 0)) * 100
+        }
+    except Exception as e:
+        print(f"Warning: Could not fetch or parse fundamental data for {ticker} due to {e}. Proceeding without it.")
+        return { 'pe_ratio': 0, 'eps': 0, 'book_value': 0, 'dividend_yield': 0 }
+
 
 def extract_ticker_from_filename(filename: str):
     try:
         parts = filename.split('-')
         ticker = parts[2]
-        return f"{ticker}.BSE" 
+        # Use .NS as it's more common for Alpha Vantage
+        return f"{ticker}.NS" 
     except Exception:
         return "UNKNOWN_TICKER"
 
@@ -89,11 +92,16 @@ def analyze_dataframe(data: pd.DataFrame, historical_performance: pd.DataFrame, 
         data = data.merge(historical_performance, left_index=True, right_index=True, how='left')
         data['direction_correct'].fillna(method='ffill', inplace=True)
         data['price_prediction_error'].fillna(method='ffill', inplace=True)
-    data.fillna({'direction_correct': 0.5, 'price_prediction_error': data['price_prediction_error'].mean()}, inplace=True)
+    
+    # Fill any remaining NaNs after the forward fill
+    data.fillna({
+        'direction_correct': 0.5, # Default to 50% accuracy if no history
+        'price_prediction_error': data['price_prediction_error'].mean() if not pd.isna(data['price_prediction_error'].mean()) else 0
+    }, inplace=True)
     
     data['Future_Close'] = data['Close'].shift(-FUTURE_DAYS)
     data['Target_Direction'] = (data['Future_Close'] > data['Close']).astype(int)
-    data.dropna(inplace=True)
+    data.dropna(subset=['Future_Close'], inplace=True) # Drop only rows where the future is unknown
     
     if len(data) < 100:
         raise ValueError("Not enough historical data rows for analysis.")
@@ -103,11 +111,17 @@ def analyze_dataframe(data: pd.DataFrame, historical_performance: pd.DataFrame, 
         'pe_ratio', 'eps', 'book_value', 'dividend_yield',
         'direction_correct', 'price_prediction_error'
     ]
+    
+    # Drop rows where any feature is still NaN (e.g., from rolling means)
+    data.dropna(subset=features, inplace=True)
+    if len(data) < 2: # Need at least one row to train and one to predict
+        raise ValueError("Not enough clean data rows to form a training set.")
+        
     X = data[features]
     
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-    X_predict_scaled = scaler.transform(X.tail(1))
+    X_predict_scaled = X_scaled[-1].reshape(1, -1)
     X_train_scaled = X_scaled[:-1]
 
     y_clf = data['Target_Direction']
@@ -115,8 +129,10 @@ def analyze_dataframe(data: pd.DataFrame, historical_performance: pd.DataFrame, 
     direction_prediction = clf_model.predict(X_predict_scaled)[0]
     ml_signal = "UPWARD" if direction_prediction == 1 else "DOWNWARD"
 
-    y_reg = data['Future_Close']
-    reg_model = RandomForestRegressor(n_estimators=100, random_state=42).fit(X_train_scaled, y_reg.iloc[:-1])
+    y_reg = data['Close'].shift(-FUTURE_DAYS).dropna() # Use the already shifted 'Close'
+    y_reg_train = data['Future_Close'].iloc[:-1] # Target for training
+    
+    reg_model = RandomForestRegressor(n_estimators=100, random_state=42).fit(X_train_scaled, y_reg_train)
     predicted_price = reg_model.predict(X_predict_scaled)[0]
 
     last_row = data.iloc[-1]
@@ -243,4 +259,3 @@ async def get_performance_stats():
         return combined_stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calculating stats: {str(e)}")
-
