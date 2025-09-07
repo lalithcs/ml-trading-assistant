@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- Environment Variables & Connections ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -38,19 +38,17 @@ def read_root():
 
 def get_fundamentals_from_alpha_vantage(ticker: str):
     """Fetches fundamental data for a given ticker from Alpha Vantage."""
-    # Ticker format for AV is just the symbol, e.g., "RELIANCE"
     symbol = ticker.split('.')[0]
     
-    url_overview = f'https://www.alphavantage.co/query?function=OVERVIEW&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}'
+    url_overview = f'[https://www.alphavantage.co/query?function=OVERVIEW&symbol=](https://www.alphavantage.co/query?function=OVERVIEW&symbol=){symbol}&apikey={ALPHA_VANTAGE_API_KEY}'
     response_overview = requests.get(url_overview)
     if response_overview.status_code != 200:
         raise ValueError(f"Could not fetch fundamental data for {ticker}.")
         
     overview_data = response_overview.json()
     if not overview_data or 'PERatio' not in overview_data or overview_data.get('PERatio') in [None, 'None']:
-        # If data for .BSE fails, try .NS as a fallback for some tickers
         if ticker.endswith(".BSE"):
-             time.sleep(13) # Wait before fallback
+             time.sleep(13)
              return get_fundamentals_from_alpha_vantage(f"{symbol}.NS")
         raise ValueError(f"Fundamental data incomplete or missing for {ticker}.")
 
@@ -71,7 +69,6 @@ def extract_ticker_from_filename(filename: str):
 
 def analyze_dataframe(data: pd.DataFrame, historical_performance: pd.DataFrame, fundamentals: dict):
     """Runs ML analysis with technical, fundamental, and learning loop features."""
-    # --- Feature Engineering ---
     delta = data['Close'].diff()
     gain = (delta.where(delta > 0, 0)).ewm(com=13, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(com=13, adjust=False).mean()
@@ -82,11 +79,9 @@ def analyze_dataframe(data: pd.DataFrame, historical_performance: pd.DataFrame, 
     data['sma_long'] = data['Close'].rolling(window=100).mean()
     data['volatility'] = data['Close'].rolling(window=20).std()
     
-    # Add fundamental features
     for key, value in fundamentals.items():
         data[key] = value
 
-    # Add learning loop features
     if not historical_performance.empty:
         data = data.merge(historical_performance, left_index=True, right_index=True, how='left')
         data['direction_correct'].fillna(method='ffill', inplace=True)
@@ -144,7 +139,6 @@ async def run_daily_analysis():
         filename = file_info['name']
         ticker = extract_ticker_from_filename(filename)
         try:
-            # 1. Get Price Data from Storage
             response = supabase.storage.from_(BUCKET_NAME).download(filename)
             content = response.decode('utf-8')
             df = pd.read_csv(io.StringIO(content))
@@ -153,35 +147,41 @@ async def run_daily_analysis():
             df['Date'] = pd.to_datetime(df['Date_str'], format='%d-%b-%Y')
             df.set_index('Date', inplace=True)
             df.sort_index(inplace=True)
-            df['Close'] = df['Close'].astype(float)
             
-            # 2. Get Fundamental Data from API
+            # --- THIS IS THE FIX ---
+            # Convert 'Close' column to string, remove commas, then convert to float
+            df['Close'] = df['Close'].astype(str).str.replace(',', '').astype(float)
+            
             fundamentals = get_fundamentals_from_alpha_vantage(ticker)
             
-            # 3. Backtest Previous Prediction
             last_date_in_file = df.index[-1]
             prediction_date_str = last_date_in_file.strftime('%Y-%m-%d')
-            previous_trading_day_data = df.index[-2]
-            previous_trading_day_str = previous_trading_day_data.strftime('%Y-%m-%d')
-            todays_actual_close = df.iloc[-1]['Close']
+            
+            pred_to_test_res = supabase.table('daily_predictions').select('*').eq('ticker', ticker).is_('direction_correct', 'null').order('prediction_date', desc=False).limit(1).execute()
 
-            response_old_pred = supabase.table('daily_predictions').select('id, ml_direction_signal, predicted_price, last_close_price').eq('ticker', ticker).eq('prediction_date', previous_trading_day_str).execute()
-            if response_old_pred.data:
-                old_prediction = response_old_pred.data[0]
-                prediction_id = old_prediction['id']
-                predicted_direction_was_up = old_prediction['ml_direction_signal'] == 'UPWARD'
-                past_close_price = old_prediction['last_close_price']
-                actual_direction_is_up = todays_actual_close > past_close_price
-                direction_was_correct = bool(predicted_direction_was_up == actual_direction_is_up)
-                price_pred = old_prediction['predicted_price']
-                price_error = abs(todays_actual_close - price_pred)
-                supabase.table('daily_predictions').update({
-                    'actual_future_close': float(todays_actual_close),
-                    'direction_correct': direction_was_correct,
-                    'price_prediction_error': float(price_error)
-                }).eq('id', prediction_id).execute()
+            if pred_to_test_res.data:
+                pred_to_test = pred_to_test_res.data[0]
+                pred_date = datetime.strptime(pred_to_test['prediction_date'], '%Y-%m-%d').date()
+                
+                if pred_date < last_date_in_file.date():
+                    actual_close_date = pred_date + pd.tseries.offsets.BusinessDay(n=FUTURE_DAYS)
+                    
+                    if actual_close_date.date() in df.index.date:
+                        todays_actual_close = df.loc[df.index.date == actual_close_date.date()]['Close'].iloc[0]
+                        prediction_id = pred_to_test['id']
+                        predicted_direction_was_up = pred_to_test['ml_direction_signal'] == 'UPWARD'
+                        past_close_price = pred_to_test['last_close_price']
+                        actual_direction_is_up = todays_actual_close > past_close_price
+                        direction_was_correct = bool(predicted_direction_was_up == actual_direction_is_up)
+                        price_pred = pred_to_test['predicted_price']
+                        price_error = abs(todays_actual_close - price_pred)
+                        
+                        supabase.table('daily_predictions').update({
+                            'actual_future_close': float(todays_actual_close),
+                            'direction_correct': direction_was_correct,
+                            'price_prediction_error': float(price_error)
+                        }).eq('id', prediction_id).execute()
 
-            # 4. Get Learning Data
             perf_response = supabase.table('daily_predictions').select('prediction_date, direction_correct, price_prediction_error').eq('ticker', ticker).not_.is_('direction_correct', 'null').execute()
             historical_performance = pd.DataFrame(perf_response.data)
             if not historical_performance.empty:
@@ -189,7 +189,6 @@ async def run_daily_analysis():
                 historical_performance.set_index('prediction_date', inplace=True)
                 historical_performance['direction_correct'] = historical_performance['direction_correct'].astype(int)
 
-            # 5. Make New Prediction
             new_prediction_result = analyze_dataframe(df.copy(), historical_performance, fundamentals)
             
             prediction_record = {
@@ -210,7 +209,6 @@ async def run_daily_analysis():
             print(error_message)
             all_results[filename] = {"error": error_message}
         
-        # Respect Alpha Vantage free tier API limit
         time.sleep(13)
             
     return {"status": "Analysis and backtesting complete", "results": all_results}
@@ -244,4 +242,3 @@ async def get_performance_stats():
         return combined_stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calculating stats: {str(e)}")
-
