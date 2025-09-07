@@ -2,9 +2,9 @@
 import os
 import pandas as pd
 import numpy as np
-import requests
 import io
 import time
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
@@ -12,12 +12,10 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from datetime import datetime
 
-# --- Environment Variables ---
+# --- Environment Variables & Connections ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY")
-
-# --- Connections ---
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI()
 
@@ -31,65 +29,49 @@ app.add_middleware(
 )
 
 # --- Configuration ---
-TICKERS_TO_ANALYZE = [
-    "RELIANCE.BSE", "TCS.BSE", "HDFCBANK.BSE", "INFY.BSE", "ICICIBANK.BSE",
-    "HINDUNILVR.BSE", "SBIN.BSE", "BHARTIARTL.BSE", "ITC.BSE", "LT.BSE"
-]
 FUTURE_DAYS = 1
+BUCKET_NAME = "daily-data"
 
 @app.get("/")
 def read_root():
-    return {"status": "ML Trading Assistant Backend (v5 - Alpha Vantage) is running."}
+    return {"status": "ML Trading Assistant Backend (v4 - Hybrid) is running."}
 
-def get_data_from_alpha_vantage(ticker: str):
-    """Fetches both time series and fundamental data for a given ticker."""
-    if not ALPHA_VANTAGE_API_KEY:
-        raise ValueError("ALPHA_VANTAGE_API_KEY is not set in environment variables.")
-
-    # 1. Fetch Historical Price Data
-    url_prices = f'https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={ticker}&outputsize=full&apikey={ALPHA_VANTAGE_API_KEY}&datatype=csv'
-    response_prices = requests.get(url_prices)
-    if response_prices.status_code != 200:
-        raise ValueError(f"Could not fetch price data for {ticker}. Status: {response_prices.status_code}")
+def get_fundamentals_from_alpha_vantage(ticker: str):
+    """Fetches fundamental data for a given ticker from Alpha Vantage."""
+    # Ticker format for AV is just the symbol, e.g., "RELIANCE"
+    symbol = ticker.split('.')[0]
     
-    csv_text = response_prices.text
-    # NEW: Robust check for API error messages
-    if not csv_text.strip().startswith('timestamp'):
-         raise ValueError(f"Alpha Vantage did not return valid CSV data for {ticker}. Response: {csv_text[:200]}")
-
-    price_data = pd.read_csv(io.StringIO(csv_text))
-        
-    price_data.rename(columns={
-        'timestamp': 'Date', 'adjusted_close': 'Close', 'open': 'Open',
-        'high': 'High', 'low': 'Low', 'volume': 'Volume'
-    }, inplace=True)
-    price_data['Date'] = pd.to_datetime(price_data['Date'])
-    price_data.set_index('Date', inplace=True)
-    price_data.sort_index(inplace=True)
-
-    # 2. Fetch Fundamental Data
-    time.sleep(13) # Add delay between API calls
-    url_overview = f'https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={ALPHA_VANTAGE_API_KEY}'
+    url_overview = f'https://www.alphavantage.co/query?function=OVERVIEW&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}'
     response_overview = requests.get(url_overview)
     if response_overview.status_code != 200:
-        raise ValueError(f"Could not fetch fundamental data for {ticker}. Status: {response_overview.status_code}")
+        raise ValueError(f"Could not fetch fundamental data for {ticker}.")
         
     overview_data = response_overview.json()
     if not overview_data or 'PERatio' not in overview_data or overview_data.get('PERatio') in [None, 'None']:
+        # If data for .BSE fails, try .NS as a fallback for some tickers
+        if ticker.endswith(".BSE"):
+             time.sleep(13) # Wait before fallback
+             return get_fundamentals_from_alpha_vantage(f"{symbol}.NS")
         raise ValueError(f"Fundamental data incomplete or missing for {ticker}.")
 
-    fundamentals = {
+    return {
         'pe_ratio': float(overview_data.get('PERatio', 0)),
         'eps': float(overview_data.get('EPS', 0)),
         'book_value': float(overview_data.get('BookValue', 0)),
         'dividend_yield': float(overview_data.get('DividendYield', 0)) * 100
     }
 
-    return price_data, fundamentals
+def extract_ticker_from_filename(filename: str):
+    try:
+        parts = filename.split('-')
+        ticker = parts[2]
+        return f"{ticker}.BSE" 
+    except Exception:
+        return "UNKNOWN_TICKER"
 
 def analyze_dataframe(data: pd.DataFrame, historical_performance: pd.DataFrame, fundamentals: dict):
     """Runs ML analysis with technical, fundamental, and learning loop features."""
-    # --- Technical Feature Engineering ---
+    # --- Feature Engineering ---
     delta = data['Close'].diff()
     gain = (delta.where(delta > 0, 0)).ewm(com=13, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(com=13, adjust=False).mean()
@@ -100,15 +82,17 @@ def analyze_dataframe(data: pd.DataFrame, historical_performance: pd.DataFrame, 
     data['sma_long'] = data['Close'].rolling(window=100).mean()
     data['volatility'] = data['Close'].rolling(window=20).std()
     
+    # Add fundamental features
     for key, value in fundamentals.items():
         data[key] = value
 
+    # Add learning loop features
     if not historical_performance.empty:
         data = data.merge(historical_performance, left_index=True, right_index=True, how='left')
         data['direction_correct'].fillna(method='ffill', inplace=True)
         data['price_prediction_error'].fillna(method='ffill', inplace=True)
     data.fillna({'direction_correct': 0.5, 'price_prediction_error': data['price_prediction_error'].mean()}, inplace=True)
-
+    
     data['Future_Close'] = data['Close'].shift(-FUTURE_DAYS)
     data['Target_Direction'] = (data['Future_Close'] > data['Close']).astype(int)
     data.dropna(inplace=True)
@@ -122,6 +106,7 @@ def analyze_dataframe(data: pd.DataFrame, historical_performance: pd.DataFrame, 
         'direction_correct', 'price_prediction_error'
     ]
     X = data[features]
+    
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     X_predict_scaled = scaler.transform(X.tail(1))
@@ -138,42 +123,65 @@ def analyze_dataframe(data: pd.DataFrame, historical_performance: pd.DataFrame, 
 
     last_row = data.iloc[-1]
     trend_signal = "Bullish" if last_row['sma_short'] > last_row['sma_long'] else "Bearish"
-    importances = clf_model.feature_importances_
-    feature_importance_dict = {feature: float(importance) for feature, importance in zip(features, importances)}
-
+    
     return {
         "last_close_price": float(last_row['Close']), "predicted_price": float(predicted_price),
         "trend_signal": str(trend_signal), "ml_direction_signal": str(ml_signal),
-        "fundamentals": fundamentals, "feature_importance": feature_importance_dict
+        "fundamentals": fundamentals
     }
 
 @app.post("/run-daily-analysis")
 async def run_daily_analysis():
     all_results = {}
-    for ticker in TICKERS_TO_ANALYZE:
-        try:
-            price_data, fundamentals = get_data_from_alpha_vantage(ticker)
-            last_date_in_file = price_data.index[-1]
-            prediction_date_str = last_date_in_file.strftime('%Y-%m-%d')
-            # Use pandas to find the last business day, which handles weekends/holidays
-            previous_trading_day = last_date_in_file - pd.tseries.offsets.BusinessDay(n=1)
-            previous_trading_day_str = previous_trading_day.strftime('%Y-%m-%d')
-            todays_actual_close = price_data.iloc[-1]['Close']
+    try:
+        files = supabase.storage.from_(BUCKET_NAME).list()
+    except Exception as e:
+        return {"status": "Error", "message": f"Could not list files: {e}"}
 
-            response = supabase.table('daily_predictions').select('id, ml_direction_signal, predicted_price, last_close_price').eq('ticker', ticker).eq('prediction_date', previous_trading_day_str).execute()
-            if response.data:
-                old_prediction = response.data[0]
-                prediction_id, past_close_price = old_prediction['id'], old_prediction['last_close_price']
+    csv_files = [f for f in files if f['name'].endswith('.csv')]
+
+    for file_info in csv_files:
+        filename = file_info['name']
+        ticker = extract_ticker_from_filename(filename)
+        try:
+            # 1. Get Price Data from Storage
+            response = supabase.storage.from_(BUCKET_NAME).download(filename)
+            content = response.decode('utf-8')
+            df = pd.read_csv(io.StringIO(content))
+            df.columns = [c.strip().replace(' ', '_') for c in df.columns]
+            df.rename(columns={'Date': 'Date_str', 'close': 'Close'}, inplace=True)
+            df['Date'] = pd.to_datetime(df['Date_str'], format='%d-%b-%Y')
+            df.set_index('Date', inplace=True)
+            df.sort_index(inplace=True)
+            df['Close'] = df['Close'].astype(float)
+            
+            # 2. Get Fundamental Data from API
+            fundamentals = get_fundamentals_from_alpha_vantage(ticker)
+            
+            # 3. Backtest Previous Prediction
+            last_date_in_file = df.index[-1]
+            prediction_date_str = last_date_in_file.strftime('%Y-%m-%d')
+            previous_trading_day_data = df.index[-2]
+            previous_trading_day_str = previous_trading_day_data.strftime('%Y-%m-%d')
+            todays_actual_close = df.iloc[-1]['Close']
+
+            response_old_pred = supabase.table('daily_predictions').select('id, ml_direction_signal, predicted_price, last_close_price').eq('ticker', ticker).eq('prediction_date', previous_trading_day_str).execute()
+            if response_old_pred.data:
+                old_prediction = response_old_pred.data[0]
+                prediction_id = old_prediction['id']
                 predicted_direction_was_up = old_prediction['ml_direction_signal'] == 'UPWARD'
+                past_close_price = old_prediction['last_close_price']
                 actual_direction_is_up = todays_actual_close > past_close_price
                 direction_was_correct = bool(predicted_direction_was_up == actual_direction_is_up)
-                price_error = abs(todays_actual_close - old_prediction['predicted_price'])
+                price_pred = old_prediction['predicted_price']
+                price_error = abs(todays_actual_close - price_pred)
                 supabase.table('daily_predictions').update({
                     'actual_future_close': float(todays_actual_close),
                     'direction_correct': direction_was_correct,
                     'price_prediction_error': float(price_error)
                 }).eq('id', prediction_id).execute()
 
+            # 4. Get Learning Data
             perf_response = supabase.table('daily_predictions').select('prediction_date, direction_correct, price_prediction_error').eq('ticker', ticker).not_.is_('direction_correct', 'null').execute()
             historical_performance = pd.DataFrame(perf_response.data)
             if not historical_performance.empty:
@@ -181,7 +189,8 @@ async def run_daily_analysis():
                 historical_performance.set_index('prediction_date', inplace=True)
                 historical_performance['direction_correct'] = historical_performance['direction_correct'].astype(int)
 
-            new_prediction_result = analyze_dataframe(price_data.copy(), historical_performance, fundamentals)
+            # 5. Make New Prediction
+            new_prediction_result = analyze_dataframe(df.copy(), historical_performance, fundamentals)
             
             prediction_record = {
                 "ticker": ticker, "prediction_date": prediction_date_str,
@@ -197,14 +206,14 @@ async def run_daily_analysis():
             supabase.table('daily_predictions').upsert(prediction_record, on_conflict='ticker, prediction_date').execute()
             all_results[ticker] = new_prediction_result
         except Exception as e:
-            error_message = f"Error analyzing {ticker}: {str(e)}"
+            error_message = f"Error analyzing {filename}: {str(e)}"
             print(error_message)
-            all_results[ticker] = {"error": error_message}
+            all_results[filename] = {"error": error_message}
         
         # Respect Alpha Vantage free tier API limit
         time.sleep(13)
             
-    return {"status": "Analysis complete", "results": all_results}
+    return {"status": "Analysis and backtesting complete", "results": all_results}
 
 @app.get("/get-latest-predictions")
 async def get_latest_predictions():
@@ -235,18 +244,4 @@ async def get_performance_stats():
         return combined_stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calculating stats: {str(e)}")
-
-@app.get("/get-feature-importance")
-async def get_feature_importance():
-    try:
-        example_ticker = TICKERS_TO_ANALYZE[0]
-        # Respect API limit by adding a delay
-        time.sleep(13)
-        price_data, fundamentals = get_data_from_alpha_vantage(example_ticker)
-        empty_perf = pd.DataFrame(columns=['prediction_date', 'direction_correct', 'price_prediction_error']).set_index('prediction_date')
-        
-        analysis_result = analyze_dataframe(price_data.copy(), empty_perf, fundamentals)
-        return analysis_result.get("feature_importance", {})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error calculating feature importance: {str(e)}")
 
