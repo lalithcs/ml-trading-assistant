@@ -42,7 +42,7 @@ def get_fundamentals_from_alpha_vantage(ticker: str):
     
     # --- THIS IS THE FIX ---
     # Correctly formatted URL without markdown
-    url_overview = f'[https://www.alphavantage.co/query?function=OVERVIEW&symbol=](https://www.alphavantage.co/query?function=OVERVIEW&symbol=){symbol}&apikey={ALPHA_VANTAGE_API_KEY}'
+    url_overview = f'https://www.alphavantage.co/query?function=OVERVIEW&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}'
     
     response_overview = requests.get(url_overview)
     if response_overview.status_code != 200:
@@ -243,3 +243,4 @@ async def get_performance_stats():
         return combined_stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calculating stats: {str(e)}")
+
